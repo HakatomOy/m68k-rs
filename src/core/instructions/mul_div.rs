@@ -102,6 +102,16 @@ impl CpuCore {
         self.flush_sync(bus);
     }
 
+    fn finish_m68000_div<B: AddressBus>(&mut self, bus: &mut B, clocks: i32) {
+        // OneROM A500 phase sweeps place the divider's internal interval
+        // before its final prefetch/IPL poll. Moving that fetch earlier keeps
+        // the uncontended total but changes bitplane contention and delays
+        // an interrupt arriving during the division by one instruction.
+        self.internal_cycles(clocks.saturating_sub(4) as u32);
+        self.flush_sync(bus);
+        self.top_up_prefetch(bus);
+    }
+
     /// Execute MULU (unsigned 16x16 -> 32 multiply).
     ///
     /// `MULU <ea>, Dn`
@@ -216,24 +226,8 @@ impl CpuCore {
         } else {
             140
         };
-        // The final prefetch precedes the division algorithm's internal
-        // clocks (Moira: prefetch<POLL> then SYNC): the np is the
-        // instruction's last bus access and carries the IPL poll, so an
-        // interrupt rising during the division is taken one instruction
-        // later.
         if m68000 {
-            self.top_up_prefetch(bus);
-            if div_clocks > 4 {
-                self.internal_cycles((div_clocks - 4) as u32);
-                // Advance the beam for the division's internal clocks now, before
-                // the instruction boundary (Moira's SYNC runs immediately after
-                // prefetch<POLL>). Deferring them past the boundary -- to the next
-                // instruction's first bus access -- mistimes CPU-vs-bitplane-DMA
-                // contention during an active display, doubling the beam cost of a
-                // DIV run mid-fetch (timing-test row 31 8722 -> 4820 cck vs vAmiga
-                // 4790; TEK Rampage's Ellis scene depends on it).
-                self.flush_sync(bus);
-            }
+            self.finish_m68000_div(bus, div_clocks);
         }
 
         let quotient = dst / src;
@@ -299,24 +293,8 @@ impl CpuCore {
         } else {
             158
         };
-        // The final prefetch precedes the division algorithm's internal
-        // clocks (Moira: prefetch<POLL> then SYNC): the np is the
-        // instruction's last bus access and carries the IPL poll, so an
-        // interrupt rising during the division is taken one instruction
-        // later.
         if m68000 {
-            self.top_up_prefetch(bus);
-            if div_clocks > 4 {
-                self.internal_cycles((div_clocks - 4) as u32);
-                // Advance the beam for the division's internal clocks now, before
-                // the instruction boundary (Moira's SYNC runs immediately after
-                // prefetch<POLL>). Deferring them past the boundary -- to the next
-                // instruction's first bus access -- mistimes CPU-vs-bitplane-DMA
-                // contention during an active display, doubling the beam cost of a
-                // DIV run mid-fetch (timing-test row 31 8722 -> 4820 cck vs vAmiga
-                // 4790; TEK Rampage's Ellis scene depends on it).
-                self.flush_sync(bus);
-            }
+            self.finish_m68000_div(bus, div_clocks);
         }
 
         // Special case: 0x80000000 / -1 = 0x80000000 (would overflow)
