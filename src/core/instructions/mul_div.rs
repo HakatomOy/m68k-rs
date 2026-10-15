@@ -67,7 +67,7 @@ fn divs_cycles(dividend: i32, divisor: i16) -> i32 {
     }
     let adivisor = (divisor as i32).unsigned_abs();
     let adividend = (dividend as i64).unsigned_abs() as u32;
-    // Early overflow: |quotient| cannot fit in 15 bits.
+    // Early absolute overflow: the unsigned magnitude cannot fit in 16 bits.
     if (adividend >> 16) >= adivisor {
         return (mcycles + 2) * 2;
     }
@@ -102,12 +102,21 @@ impl CpuCore {
         self.flush_sync(bus);
     }
 
-    fn finish_m68000_div<B: AddressBus>(&mut self, bus: &mut B, clocks: i32) {
-        // OneROM A500 phase sweeps place the divider's internal interval
-        // before its final prefetch/IPL poll. Moving that fetch earlier keeps
-        // the uncontended total but changes bitplane contention and delays
-        // an interrupt arriving during the division by one instruction.
-        self.internal_cycles(clocks.saturating_sub(4) as u32);
+    fn finish_m68000_div<B: AddressBus>(&mut self, bus: &mut B, clocks: i32, early_ipl: bool) {
+        // One ROM A500 phase sweeps place the divider's internal interval
+        // before its final prefetch. DIVS with a nonnegative dividend and
+        // negative divisor polls IPL two CPU clocks before that fetch, unless
+        // it terminates through early absolute overflow. Keep the bus cycle
+        // and total duration unchanged while exposing that internal poll.
+        let internal_clocks = clocks.saturating_sub(4) as u32;
+        if early_ipl && self.prefetch_enabled() {
+            self.internal_cycles(internal_clocks - 2);
+            self.flush_sync(bus);
+            bus.ipl_poll_internal();
+            self.internal_cycles(2);
+        } else {
+            self.internal_cycles(internal_clocks);
+        }
         self.flush_sync(bus);
         self.top_up_prefetch(bus);
     }
@@ -227,7 +236,7 @@ impl CpuCore {
             140
         };
         if m68000 {
-            self.finish_m68000_div(bus, div_clocks);
+            self.finish_m68000_div(bus, div_clocks, false);
         }
 
         let quotient = dst / src;
@@ -294,17 +303,29 @@ impl CpuCore {
             158
         };
         if m68000 {
-            self.finish_m68000_div(bus, div_clocks);
+            let early_ipl = dst >= 0 && src < 0 && ((dst as u32) >> 16) < src.unsigned_abs();
+            self.finish_m68000_div(bus, div_clocks, early_ipl);
         }
 
-        // Special case: 0x80000000 / -1 = 0x80000000 (would overflow)
-        // But Musashi returns quotient=0, remainder=0 for this
+        // The MC68000 leaves the dividend register untouched when the
+        // signed quotient cannot be represented. This corner case also
+        // overflows the host's i32 division operation, so handle it before
+        // calculating quotient and remainder. Preserve X; N/Z are not
+        // defined for divide overflow on this processor.
         if dst == i32::MIN && src == -1 {
-            self.set_d(dst_reg, 0);
-            self.not_z_flag = 0;
-            self.n_flag = 0;
-            self.v_flag = 0;
-            self.c_flag = 0;
+            if m68000 {
+                self.v_flag = 0x80;
+                self.n_flag = 0x80;
+                self.not_z_flag = 1; // Z = 0
+                self.c_flag = 0;
+            } else {
+                // Preserve the historical behavior for other CPU models.
+                self.set_d(dst_reg, 0);
+                self.not_z_flag = 0;
+                self.n_flag = 0;
+                self.v_flag = 0;
+                self.c_flag = 0;
+            }
             return cycles;
         }
 
